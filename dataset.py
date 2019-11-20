@@ -17,6 +17,17 @@ class AnswerType(enum.IntEnum):
     LONG = 4
 
 
+class Answer(collections.namedtuple("Answer", ["type", "text", "offset"])):
+    """Answer record.
+
+    An Answer contains the type of the answer and possibly the text (for
+    long) as well as the offset (for extractive).
+    """
+
+    def __new__(cls, type_, text=None, offset=None):
+        return super(Answer, cls).__new__(cls, type_, text, offset)
+
+
 class InputFeatures:
     """A single set of features of data."""
 
