@@ -11,22 +11,6 @@ from optimization import create_optimizer
 Span = collections.namedtuple("Span", ["start_token_idx", "end_token_idx"])
 
 
-class DummyObject:
-    def __init__(self,**kwargs):
-        self.__dict__.update(kwargs)
-
-
-FLAGS = DummyObject(skip_nested_contexts=True,
-                    max_position=50,
-                    max_contexts=48,
-                    max_query_length=64,
-                    max_seq_length=512,
-                    doc_stride=128,
-                    include_unknowns=-1.0,
-                    n_best_size=20,
-                    max_answer_length=30)
-
-
 def make_answer(contexts, answer):
     """Makes an Answer object.
 
@@ -63,9 +47,9 @@ def make_answer(contexts, answer):
 class CreateTFExampleFn:
     """Functor for creating NQ tf.Examples."""
 
-    def __init__(self, is_training):
+    def __init__(self, is_training, vocab_file, do_lower_case):
         self.is_training = is_training
-        self.tokenizer = FullTokenizer(vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+        self.tokenizer = FullTokenizer(vocab_file=vocab_file, do_lower_case=do_lower_case)
 
     def process(self, example):
         """Coverts an NQ example in a list of serialized tf examples."""
@@ -358,11 +342,11 @@ def top_k_indices(logits,n_best_size,token_map):
     return indices[-n_best_size:]
 
 
-def compute_predictions(example):
+def compute_predictions(example, n_best_size, max_answer_length):
     """Converts an example into an object for evaluation."""
     predictions = []
-    n_best_size = FLAGS.n_best_size
-    max_answer_length = FLAGS.max_answer_length
+    n_best_size = n_best_size
+    max_answer_length = max_answer_length
     i = 0
     for unique_id, result in example.results.items():
         if unique_id not in example.features:
@@ -375,7 +359,7 @@ def compute_predictions(example):
         if not end_indexes:
             continue
         indexes = np.array(list(np.broadcast(start_indexes[None],end_indexes[:,None])))
-        indexes = indexes[(indexes[:,0]<indexes[:,1])*(indexes[:,1]-indexes[:,0]<max_answer_length)]
+        indexes = indexes[(indexes[:,0]<indexes[:,1])*(indexes[:,1]-indexes[:,0] < max_answer_length)]
         for start_index,end_index in indexes:
             summary = ScoreSummary()
             summary.short_span_score = (result.start_logits[start_index] + result.end_logits[end_index])
@@ -429,7 +413,7 @@ def compute_predictions(example):
     return summary
 
 
-def predictions_to_dict(candidates_dict, dev_features, raw_results, tqdm=None):
+def predictions_to_dict(candidates_dict, dev_features, raw_results, n_best_size, max_answer_length, tqdm=None):
     """Computes official answer key from raw logits."""
     raw_results_by_id = [(int(res.unique_id), 1, res) for res in raw_results]
 
@@ -457,7 +441,7 @@ def predictions_to_dict(candidates_dict, dev_features, raw_results, tqdm=None):
     if tqdm is not None:
         examples = tqdm(examples)
     for e in examples:
-        summary = compute_predictions(e)
+        summary = compute_predictions(e, n_best_size, max_answer_length)
         nq_pred_dict[e.example_id] = summary.predicted_label
 
     return nq_pred_dict

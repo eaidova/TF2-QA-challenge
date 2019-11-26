@@ -171,7 +171,10 @@ def main():
             tf.train.Example.FromString(r)
             for r in tf.python_io.tf_record_iterator(eval_filename)
         ]
-        predictions = predictions_to_dict(candidates_dict, eval_features, [r._asdict() for r in all_results])
+        predictions = predictions_to_dict(
+            candidates_dict, eval_features, [r._asdict() for r in all_results],
+            args.n_best_size, args.max_answer_length
+        )
         predictions_json = {"predictions": predictions.values()}
         with tf.gfile.Open(args.output_prediction_file, "w") as f:
             json.dump(predictions_json, f, indent=4)
