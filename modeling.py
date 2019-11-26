@@ -164,7 +164,7 @@ def assert_rank(tensor, expected_rank, name=None):
         )
 
 
-class BertConfig(object):
+class BertConfig:
     """Configuration for `BertModel`."""
 
     def __init__(self,
@@ -281,7 +281,7 @@ class BertModel(tf.keras.layers.Layer):
     """
 
     def __init__(self, config, float_type=tf.float32, **kwargs):
-        super(BertModel, self).__init__(**kwargs)
+        super(BertModel, self).__init__()
         self.config = BertConfig.from_dict(config) if isinstance(config, dict) else copy.deepcopy(config)
         self.float_type = float_type
 

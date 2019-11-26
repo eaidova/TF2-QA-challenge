@@ -65,6 +65,7 @@ def build_arguments_parser():
                         )
     parser.add_argument('--skip_nested_contexts', required=False, action='store_true',
                         help="Completely ignore context that are not top level nodes in the page.")
+    parser.add_argument('--train_num_precomputed', required=False, type=int, help='Number of train examples')
 
     return parser
 
@@ -72,9 +73,9 @@ def build_arguments_parser():
 def main():
     parser = build_arguments_parser()
     args = parser.parse_args()
-    tf.logging.set_verbosity(tf.logging.INFO)
+    tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
     bert_config = BertConfig.from_json_file(args.bert_config_file)
-    tf.gfile.MakeDirs(args.output_dir)
+    tf.io.gfile.makedirs(args.output_dir)
     tokenizer = FullTokenizer(vocab_file=args.vocab_file, do_lower_case=args.do_lower_case)
 
     num_train_steps = None
@@ -107,11 +108,11 @@ def main():
     estimator = tf.estimator.Estimator(model_fn=model_fn,)
 
     if args.do_train:
-        tf.logging.info("***** Running training on precomputed features *****")
-        tf.logging.info("  Num split examples = %d", num_train_features)
-        tf.logging.info("  Batch size = %d", args.train_batch_size)
-        tf.logging.info("  Num steps = %d", num_train_steps)
-        train_filenames = tf.gfile.Glob(train_precomputed_file)
+        tf.compat.v1.logging.info("***** Running training on precomputed features *****")
+        tf.compat.v1.logging.info("  Num split examples = %d", num_train_features)
+        tf.compat.v1.logging.info("  Batch size = %d", args.train_batch_size)
+        tf.compat.v1.logging.info("  Num steps = %d", num_train_steps)
+        train_filenames = tf.compat.v1.gfile.Glob(train_precomputed_file)
         train_input_fn = input_fn_builder(
             input_file=train_filenames,
             seq_length=args.max_seq_length,
@@ -184,3 +185,5 @@ def main():
         predictions_json = {"predictions": predictions.values()}
         with tf.gfile.Open(args.output_prediction_file, "w") as f:
             json.dump(predictions_json, f, indent=4)
+
+main()

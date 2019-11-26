@@ -2,7 +2,7 @@ import collections
 
 import numpy as np
 import tensorflow as tf
-from dataset import AnswerType, Answer, EvalExample
+from dataset import AnswerType, EvalExample
 from modeling import BertModel, get_shape_list, get_assignment_map_from_checkpoint
 from optimization import create_optimizer
 
@@ -10,61 +10,23 @@ from optimization import create_optimizer
 Span = collections.namedtuple("Span", ["start_token_idx", "end_token_idx"])
 
 
-def make_answer(contexts, answer):
-    """Makes an Answer object.
-
-    Args:
-      contexts: string containing the context
-      answer: dictionary with `span_start` and `input_text` fields
-
-    Returns:
-      an Answer object. If the Answer type is YES or NO or LONG, the text
-      of the answer is the long answer. If the answer type is UNKNOWN, the text of
-      the answer is empty.
-    """
-    start = answer["span_start"]
-    end = answer["span_end"]
-    input_text = answer["input_text"]
-    answer_types = {
-        "yes": AnswerType.YES,
-        "no": AnswerType.NO,
-        "long": AnswerType.LONG,
-        "short": AnswerType.SHORT
-    }
-
-    if (answer["candidate_id"] == -1 or start >= len(contexts) or
-            end > len(contexts)):
-        answer_type = AnswerType.UNKNOWN
-        start = 0
-        end = 1
-    else:
-        answer_type = answer_types.get(input_text.lower(), AnswerType.SHORT)
-
-    return Answer(answer_type, text=contexts[start:end], offset=start)
-
-
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, use_one_hot_embeddings):
-    model = BertModel(
-        config=bert_config,
-        is_training=is_training,
-        input_ids=input_ids,
-        input_mask=input_mask,
-        token_type_ids=segment_ids,
-        use_one_hot_embeddings=use_one_hot_embeddings)
+    pooled_output, sequence_output = BertModel(config=bert_config)(
+        input_word_ids=input_ids, input_mask=input_mask, input_type_ids=segment_ids)
 
     # Get the logits for the start and end predictions.
-    final_hidden = model.get_sequence_output()
+    final_hidden = sequence_output
 
     final_hidden_shape = get_shape_list(final_hidden, expected_rank=3)
     batch_size = final_hidden_shape[0]
     seq_length = final_hidden_shape[1]
     hidden_size = final_hidden_shape[2]
 
-    output_weights = tf.get_variable(
-        "cls/nq/output_weights", [2, hidden_size], initializer=tf.truncated_normal_initializer(stddev=0.02)
+    output_weights = tf.compat.v1.get_variable(
+        "cls/nq/output_weights", [2, hidden_size], initializer=tf.compat.v1.truncated_normal_initializer(stddev=0.02)
     )
 
-    output_bias = tf.get_variable(
+    output_bias = tf.compat.v1.get_variable(
         "cls/nq/output_bias", [2], initializer=tf.zeros_initializer())
 
     final_hidden_matrix = tf.reshape(final_hidden, [batch_size * seq_length, hidden_size])
@@ -79,15 +41,15 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, u
     (start_logits, end_logits) = (unstacked_logits[0], unstacked_logits[1])
 
     # Get the logits for the answer type prediction.
-    answer_type_output_layer = model.get_pooled_output()
-    answer_type_hidden_size = answer_type_output_layer.shape[-1].value
+    answer_type_output_layer = pooled_output
+    answer_type_hidden_size = answer_type_output_layer.shape[-1]
 
     num_answer_types = 5  # YES, NO, UNKNOWN, SHORT, LONG
-    answer_type_output_weights = tf.get_variable(
+    answer_type_output_weights = tf.compat.v1.get_variable(
         "answer_type_output_weights", [num_answer_types, answer_type_hidden_size],
-        initializer=tf.truncated_normal_initializer(stddev=0.02))
+        initializer=tf.compat.v1.truncated_normal_initializer(stddev=0.02))
 
-    answer_type_output_bias = tf.get_variable(
+    answer_type_output_bias = tf.compat.v1.get_variable(
         "answer_type_output_bias", [num_answer_types],
         initializer=tf.zeros_initializer())
 
@@ -102,9 +64,9 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      use_one_hot_embeddings):
 
     def model_fn(features, labels, mode, params):
-        tf.logging.info("*** Features ***")
+        tf.compat.v1.logging.info("*** Features ***")
         for name in sorted(features.keys()):
-            tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+            tf.compat.v1.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
 
         unique_ids = features["unique_ids"]
         input_ids = features["input_ids"]
@@ -113,7 +75,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
-        (start_logits, end_logits, answer_type_logits) = create_model(
+        start_logits, end_logits, answer_type_logits = create_model(
             bert_config=bert_config,
             is_training=is_training,
             input_ids=input_ids,
@@ -121,18 +83,18 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
             segment_ids=segment_ids,
             use_one_hot_embeddings=use_one_hot_embeddings)
 
-        tvars = tf.trainable_variables()
+        tvars = tf.compat.v1.trainable_variables()
         initialized_variable_names = {}
         if init_checkpoint:
             assignment_map, initialized_variable_names = get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-            tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+            tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
-        tf.logging.info("**** Trainable Variables ****")
+        tf.compat.v1.logging.info("**** Trainable Variables ****")
         for var in tvars:
             init_string = ""
             if var.name in initialized_variable_names:
                 init_string = ", *INIT_FROM_CKPT*"
-            tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape, init_string)
+                tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape, init_string)
 
         if mode == tf.estimator.ModeKeys.TRAIN:
             seq_length = get_shape_list(input_ids)[1]
@@ -191,34 +153,34 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
     """Creates an `input_fn` closure to be passed to TPUEstimator."""
 
     name_to_features = {
-        "unique_ids": tf.FixedLenFeature([], tf.int64),
-        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
-        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
-        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "unique_ids": tf.compat.v1.FixedLenFeature([], tf.int64),
+        "input_ids": tf.compat.v1.FixedLenFeature([seq_length], tf.int64),
+        "input_mask": tf.compat.v1.FixedLenFeature([seq_length], tf.int64),
+        "segment_ids": tf.compat.v1.FixedLenFeature([seq_length], tf.int64),
     }
 
     if is_training:
-        name_to_features["start_positions"] = tf.FixedLenFeature([], tf.int64)
-        name_to_features["end_positions"] = tf.FixedLenFeature([], tf.int64)
-        name_to_features["answer_types"] = tf.FixedLenFeature([], tf.int64)
+        name_to_features["start_positions"] = tf.compat.v1.FixedLenFeature([], tf.int64)
+        name_to_features["end_positions"] = tf.compat.v1.FixedLenFeature([], tf.int64)
+        name_to_features["answer_types"] = tf.compat.v1.FixedLenFeature([], tf.int64)
 
     def _decode_record(record, name_to_features):
         """Decodes a record to a TensorFlow example."""
-        example = tf.parse_single_example(record, name_to_features)
+        example = tf.compat.v1.parse_single_example(record, name_to_features)
 
         # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
         # So cast all int64 to int32.
         for name in list(example.keys()):
             t = example[name]
             if t.dtype == tf.int64:
-                t = tf.to_int32(t)
+                t = tf.compat.v1.to_int32(t)
             example[name] = t
 
         return example
 
     def input_fn(params):
         """The actual input function."""
-        batch_size = params["batch_size"]
+        batch_size = params.get("batch_size", 32)
 
         # For training, we want a lot of parallel reading and shuffling.
         # For eval, we want no shuffling and parallel reading doesn't matter.

@@ -8,7 +8,6 @@ import re
 import tensorflow as tf
 from tqdm import tqdm
 
-from bert_utils import make_answer
 from tokenization import whitespace_tokenize, FullTokenizer
 
 TextSpan = collections.namedtuple("TextSpan", "token_positions text")
@@ -73,7 +72,7 @@ def get_first_annotation(example):
             start_token = annotation["short_answers"][0]["start_token"]
             end_token = annotation["short_answers"][-1]["end_token"]
 
-            return annotation, idx, (token_to_char_offset(example, idx, start_token), token_to_char_offset(e, idx, end_token) - 1)
+            return annotation, idx, (token_to_char_offset(example, idx, start_token), token_to_char_offset(example, idx, end_token) - 1)
 
     for a in positive_annotations:
         idx = a["long_answer"]["candidate_index"]
@@ -161,13 +160,17 @@ def load_dataset(file_path, max_context, max_position):
     examples = []
     with open(file_path, 'r') as json_file:
         for line in tqdm(json_file):
-            json_data = json.loads(line,  object_pairs_hook=collections.OrderedDict)
-            examples.append(create_example_from_jsonl(json_data, max_context, max_position))
+            examples.append(create_example_from_jsonl(line, max_context, max_position))
     return examples
 
 
-def create_example_from_jsonl(example, max_contexts, max_position):
+def create_example_from_jsonl(line, max_contexts, max_position):
     """Creates an NQ example from a given line of JSON."""
+    example = json.loads(line, object_pairs_hook=collections.OrderedDict)
+    document_tokens = example["document_text"].split(" ")
+    example["document_tokens"] = []
+    for token in document_tokens: example["document_tokens"].append(
+        {"token": token, "start_byte": -1, "end_byte": -1, "html_token": "<" in token})
     add_candidate_types_and_positions(example, max_position)
     annotation, annotated_idx, annotated_sa = get_first_annotation(example)
 
@@ -190,7 +193,7 @@ def create_example_from_jsonl(example, max_contexts, max_position):
     # Add a short answer if one was found.
     if annotated_sa != (-1, -1):
         answer["input_text"] = "short"
-        span_text = get_candidate_text(e, annotated_idx).text
+        span_text = get_candidate_text(example, annotated_idx).text
         answer["span_text"] = span_text[annotated_sa[0]:annotated_sa[1]]
         answer["span_start"] = annotated_sa[0]
         answer["span_end"] = annotated_sa[1]
@@ -615,9 +618,10 @@ def prepare_training_data(vocab_file, train_file, lower_case, output_file, max_c
     examples_processed = 0
     num_examples_with_correct_context = 0
     creator_fn = CreateTFExampleFn(is_training=True, vocab_file=vocab_file, do_lower_case=lower_case)
+    examples = load_dataset(train_file, max_contexts, max_position)
 
     instances = []
-    for example in examples_iter(train_file, max_contexts, max_position):
+    for example in examples:
         for instance in creator_fn.process(example):
             instances.append(instance)
         if example["has_correct_context"]:
@@ -680,3 +684,36 @@ class CreateTFExampleFn:
                 features["token_map"] = create_int_feature(token_map)
 
             yield tf.train.Example(features=tf.train.Features(feature=features)).SerializeToString()
+
+
+def make_answer(contexts, answer):
+    """Makes an Answer object.
+
+    Args:
+      contexts: string containing the context
+      answer: dictionary with `span_start` and `input_text` fields
+
+    Returns:
+      an Answer object. If the Answer type is YES or NO or LONG, the text
+      of the answer is the long answer. If the answer type is UNKNOWN, the text of
+      the answer is empty.
+    """
+    start = answer["span_start"]
+    end = answer["span_end"]
+    input_text = answer["input_text"]
+    answer_types = {
+        "yes": AnswerType.YES,
+        "no": AnswerType.NO,
+        "long": AnswerType.LONG,
+        "short": AnswerType.SHORT
+    }
+
+    if (answer["candidate_id"] == -1 or start >= len(contexts) or
+            end > len(contexts)):
+        answer_type = AnswerType.UNKNOWN
+        start = 0
+        end = 1
+    else:
+        answer_type = answer_types.get(input_text.lower(), AnswerType.SHORT)
+
+    return Answer(answer_type, text=contexts[start:end], offset=start)
