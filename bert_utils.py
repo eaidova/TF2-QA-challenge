@@ -1,12 +1,14 @@
 import collections
-import gzip
-import json
 
 import numpy as np
 import tensorflow as tf
-from dataset import AnswerType, Answer, convert_single_example, create_example_from_jsonl
-from modeling import BertModel, get_shape_list
-from tokenization import FullTokenizer, whitespace_tokenize
+from dataset import AnswerType, Answer, convert_single_example, read_entry, EvalExample
+from modeling import BertModel, get_shape_list, get_assignment_map_from_checkpoint
+from tokenization import FullTokenizer
+from optimization import create_optimizer
+
+
+Span = collections.namedtuple("Span", ["start_token_idx", "end_token_idx"])
 
 
 class DummyObject:
@@ -14,41 +16,19 @@ class DummyObject:
         self.__dict__.update(kwargs)
 
 
-FLAGS=DummyObject(skip_nested_contexts=True,
-                  max_position=50,
-                  max_contexts=48,
-                  max_query_length=64,
-                  max_seq_length=512,
-                  doc_stride=128,
-                  include_unknowns=-1.0,
-                  n_best_size=20,
-                  max_answer_length=30)
+FLAGS = DummyObject(skip_nested_contexts=True,
+                    max_position=50,
+                    max_contexts=48,
+                    max_query_length=64,
+                    max_seq_length=512,
+                    doc_stride=128,
+                    include_unknowns=-1.0,
+                    n_best_size=20,
+                    max_answer_length=30)
 
 
-class NqExample:
-    """A single training/test example."""
-
-    def __init__(self,
-                 example_id,
-                 qas_id,
-                 questions,
-                 doc_tokens,
-                 doc_tokens_map=None,
-                 answer=None,
-                 start_position=None,
-                 end_position=None):
-        self.example_id = example_id
-        self.qas_id = qas_id
-        self.questions = questions
-        self.doc_tokens = doc_tokens
-        self.doc_tokens_map = doc_tokens_map
-        self.answer = answer
-        self.start_position = start_position
-        self.end_position = end_position
-
-
-def make_nq_answer(contexts, answer):
-    """Makes an Answer object following NQ conventions.
+def make_answer(contexts, answer):
+    """Makes an Answer object.
 
     Args:
       contexts: string containing the context
@@ -80,93 +60,6 @@ def make_nq_answer(contexts, answer):
     return Answer(answer_type, text=contexts[start:end], offset=start)
 
 
-def read_nq_entry(entry, is_training):
-    """Converts a NQ entry into a list of NqExamples."""
-
-    def is_whitespace(c):
-        return c in " \t\r\n" or ord(c) == 0x202F
-
-    examples = []
-    contexts_id = entry["id"]
-    contexts = entry["contexts"]
-    doc_tokens = []
-    char_to_word_offset = []
-    prev_is_whitespace = True
-    for c in contexts:
-        if is_whitespace(c):
-            prev_is_whitespace = True
-        else:
-            if prev_is_whitespace:
-                doc_tokens.append(c)
-            else:
-                doc_tokens[-1] += c
-            prev_is_whitespace = False
-        char_to_word_offset.append(len(doc_tokens) - 1)
-
-    questions = []
-    for i, question in enumerate(entry["questions"]):
-        qas_id = "{}".format(contexts_id)
-        question_text = question["input_text"]
-        start_position = None
-        end_position = None
-        answer = None
-        if is_training:
-            answer_dict = entry["answers"][i]
-            answer = make_nq_answer(contexts, answer_dict)
-
-            # For now, only handle extractive, yes, and no.
-            if answer is None or answer.offset is None:
-                continue
-            start_position = char_to_word_offset[answer.offset]
-            end_position = char_to_word_offset[answer.offset + len(answer.text) - 1]
-
-            # Only add answers where the text can be exactly recovered from the
-            # document. If this CAN'T happen it's likely due to weird Unicode
-            # stuff so we will just skip the example.
-            #
-            # Note that this means for training mode, every example is NOT
-            # guaranteed to be preserved.
-            actual_text = " ".join(doc_tokens[start_position:(end_position + 1)])
-            cleaned_answer_text = " ".join(
-                whitespace_tokenize(answer.text))
-            if actual_text.find(cleaned_answer_text) == -1:
-                tf.compat.v1.logging.warning("Could not find answer: '%s' vs. '%s'", actual_text,
-                                             cleaned_answer_text)
-                continue
-
-        questions.append(question_text)
-        example = NqExample(
-            example_id=int(contexts_id),
-            qas_id=qas_id,
-            questions=questions[:],
-            doc_tokens=doc_tokens,
-            doc_tokens_map=entry.get("contexts_map", None),
-            answer=answer,
-            start_position=start_position,
-            end_position=end_position)
-        examples.append(example)
-    return examples
-
-
-class ConvertExamples2Features:
-    def __init__(self,tokenizer, is_training, output_fn, collect_stat=False):
-        self.tokenizer = tokenizer
-        self.is_training = is_training
-        self.output_fn = output_fn
-        self.num_spans_to_ids = collections.defaultdict(list) if collect_stat else None
-    def __call__(self,example):
-        example_index = example.example_id
-        features = convert_single_example(example, self.tokenizer, self.is_training)
-        if self.num_spans_to_ids is not None:
-            self.num_spans_to_ids[len(features)].append(example.qas_id)
-
-        for feature in features:
-            feature.example_index = example_index
-            feature.unique_id = feature.example_index + feature.doc_span_index
-            self.output_fn(feature)
-        return len(features)
-
-
 class CreateTFExampleFn:
     """Functor for creating NQ tf.Examples."""
 
@@ -176,7 +69,7 @@ class CreateTFExampleFn:
 
     def process(self, example):
         """Coverts an NQ example in a list of serialized tf examples."""
-        nq_examples = read_nq_entry(example, self.is_training)
+        nq_examples = read_entry(example, self.is_training)
         input_features = []
         for nq_example in nq_examples:
             input_features.extend(convert_single_example(nq_example, self.tokenizer, self.is_training))
@@ -213,123 +106,70 @@ class CreateTFExampleFn:
                 feature=features)).SerializeToString()
 
 
-def nq_examples_iter(input_file, is_training,tqdm=None):
-    """Read a NQ json file into a list of NqExample."""
-    input_paths = tf.io.gfile.glob(input_file)
-    input_data = []
-
-    def _open(path):
-        if path.endswith(".gz"):
-            return gzip.GzipFile(fileobj=tf.io.gfile.GFile(path, "rb"))
-        else:
-            return tf.io.gfile.GFile(path, "r")
-
-    for path in input_paths:
-        #tf.compat.v1.logging.info
-        print("Reading: %s"% path)
-        with _open(path) as input_file:
-            if tqdm is not None:
-                input_file = tqdm(input_file)
-            for index, line in enumerate(input_file):
-                entry = create_example_from_jsonl(line)
-                yield read_nq_entry(entry, is_training)
-
-
-def read_nq_examples(input_file, is_training,tqdm=None):
-    """Read a NQ json file into a list of NqExample."""
-    input_paths = tf.io.gfile.glob(input_file)
-    input_data = []
-
-    def _open(path):
-        if path.endswith(".gz"):
-            return gzip.GzipFile(fileobj=tf.io.gfile.GFile(path, "rb"))
-        else:
-            return tf.io.gfile.GFile(path, "r")
-
-    for path in input_paths:
-        tf.compat.v1.logging.info("Reading: %s", path)
-        with _open(path) as input_file:
-            if tqdm is not None:
-                input_file = tqdm(input_file)
-            for index, line in enumerate(input_file):
-                input_data.append(create_example_from_jsonl(line))
-                # if index > 100:
-                #     break
-
-    examples = []
-    for entry in input_data:
-        examples.extend(read_nq_entry(entry, is_training))
-    return examples
-
-
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, use_one_hot_embeddings):
-    """Creates a classification model."""
-    pooled_output, sequence_output = BertModel(config=bert_config)(
-        input_word_ids=input_ids,
+    model = BertModel(
+        config=bert_config,
+        is_training=is_training,
+        input_ids=input_ids,
         input_mask=input_mask,
-        input_type_ids=segment_ids)
+        token_type_ids=segment_ids,
+        use_one_hot_embeddings=use_one_hot_embeddings)
 
     # Get the logits for the start and end predictions.
-    final_hidden = sequence_output #get_sequence_output()
+    final_hidden = model.get_sequence_output()
 
     final_hidden_shape = get_shape_list(final_hidden, expected_rank=3)
     batch_size = final_hidden_shape[0]
     seq_length = final_hidden_shape[1]
     hidden_size = final_hidden_shape[2]
 
-    output_weights = tf.compat.v1.get_variable(
-        "cls/nq/output_weights", [2, hidden_size],
-        initializer=tf.compat.v1.truncated_normal_initializer(stddev=0.02))
+    output_weights = tf.get_variable(
+        "cls/nq/output_weights", [2, hidden_size], initializer=tf.truncated_normal_initializer(stddev=0.02)
+    )
 
-    output_bias = tf.compat.v1.get_variable(
-        "cls/nq/output_bias", [2], initializer=tf.compat.v1.zeros_initializer())
+    output_bias = tf.get_variable(
+        "cls/nq/output_bias", [2], initializer=tf.zeros_initializer())
 
-    final_hidden_matrix = tf.reshape(final_hidden,
-                                     [batch_size * seq_length, hidden_size])
+    final_hidden_matrix = tf.reshape(final_hidden, [batch_size * seq_length, hidden_size])
     logits = tf.matmul(final_hidden_matrix, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
 
     logits = tf.reshape(logits, [batch_size, seq_length, 2])
-    logits = tf.transpose(a=logits, perm=[2, 0, 1])
+    logits = tf.transpose(logits, [2, 0, 1])
 
     unstacked_logits = tf.unstack(logits, axis=0)
 
     (start_logits, end_logits) = (unstacked_logits[0], unstacked_logits[1])
 
     # Get the logits for the answer type prediction.
-    answer_type_output_layer = pooled_output #model.get_pooled_output()
-    answer_type_hidden_size = answer_type_output_layer.shape[-1] #.value
+    answer_type_output_layer = model.get_pooled_output()
+    answer_type_hidden_size = answer_type_output_layer.shape[-1].value
 
     num_answer_types = 5  # YES, NO, UNKNOWN, SHORT, LONG
-    answer_type_output_weights = tf.compat.v1.get_variable(
+    answer_type_output_weights = tf.get_variable(
         "answer_type_output_weights", [num_answer_types, answer_type_hidden_size],
-        initializer=tf.compat.v1.truncated_normal_initializer(stddev=0.02))
+        initializer=tf.truncated_normal_initializer(stddev=0.02))
 
-    answer_type_output_bias = tf.compat.v1.get_variable(
+    answer_type_output_bias = tf.get_variable(
         "answer_type_output_bias", [num_answer_types],
-        initializer=tf.compat.v1.zeros_initializer())
+        initializer=tf.zeros_initializer())
 
-    answer_type_logits = tf.matmul(
-        answer_type_output_layer, answer_type_output_weights, transpose_b=True)
-    answer_type_logits = tf.nn.bias_add(answer_type_logits,
-                                        answer_type_output_bias)
+    answer_type_logits = tf.matmul(answer_type_output_layer, answer_type_output_weights, transpose_b=True)
+    answer_type_logits = tf.nn.bias_add(answer_type_logits, answer_type_output_bias)
 
-    return (start_logits, end_logits, answer_type_logits)
+    return start_logits, end_logits, answer_type_logits
 
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
-                     num_train_steps, num_warmup_steps, use_tpu,
+                     num_train_steps, num_warmup_steps,
                      use_one_hot_embeddings):
-    """Returns `model_fn` closure for TPUEstimator."""
 
-    def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
-        """The `model_fn` for TPUEstimator."""
-
-        tf.compat.v1.logging.info("*** Features ***")
+    def model_fn(features, labels, mode, params):
+        tf.logging.info("*** Features ***")
         for name in sorted(features.keys()):
-            tf.compat.v1.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+            tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
 
-        unique_id = features["unique_id"]
+        unique_ids = features["unique_ids"]
         input_ids = features["input_ids"]
         input_mask = features["input_mask"]
         segment_ids = features["segment_ids"]
@@ -344,32 +184,19 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
             segment_ids=segment_ids,
             use_one_hot_embeddings=use_one_hot_embeddings)
 
-        tvars = tf.compat.v1.trainable_variables()
-
+        tvars = tf.trainable_variables()
         initialized_variable_names = {}
-        scaffold_fn = None
         if init_checkpoint:
-            model_tf = tf.keras.Model()
-            checkpoint_tf = tf.train.Checkpoint(model=model_tf)
-            checkpoint_tf.restore(init_checkpoint)
-            if use_tpu:
-                def tpu_scaffold():
-                    tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
-                    return tf.compat.v1.train.Scaffold()
+            assignment_map, initialized_variable_names = get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+            tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
-                scaffold_fn = tpu_scaffold
-        #       else:
-        #         tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
-        tf.compat.v1.logging.info("**** Trainable Variables ****")
+        tf.logging.info("**** Trainable Variables ****")
         for var in tvars:
             init_string = ""
             if var.name in initialized_variable_names:
                 init_string = ", *INIT_FROM_CKPT*"
-            tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                                      init_string)
+            tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape, init_string)
 
-        output_spec = None
         if mode == tf.estimator.ModeKeys.TRAIN:
             seq_length = get_shape_list(input_ids)[1]
 
@@ -379,7 +206,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                     positions, depth=seq_length, dtype=tf.float32)
                 log_probs = tf.nn.log_softmax(logits, axis=-1)
                 loss = -tf.reduce_mean(
-                    input_tensor=tf.reduce_sum(input_tensor=one_hot_positions * log_probs, axis=-1))
+                    tf.reduce_sum(one_hot_positions * log_probs, axis=-1))
                 return loss
 
             # Computes the loss for labels.
@@ -388,7 +215,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                     labels, depth=len(AnswerType), dtype=tf.float32)
                 log_probs = tf.nn.log_softmax(logits, axis=-1)
                 loss = -tf.reduce_mean(
-                    input_tensor=tf.reduce_sum(input_tensor=one_hot_labels * log_probs, axis=-1))
+                    tf.reduce_sum(one_hot_labels * log_probs, axis=-1))
                 return loss
 
             start_positions = features["start_positions"]
@@ -401,27 +228,22 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
             total_loss = (start_loss + end_loss + answer_type_loss) / 3.0
 
-            train_op = optimization.create_optimizer(total_loss, learning_rate,
-                                                     num_train_steps,
-                                                     num_warmup_steps, use_tpu)
+            train_op = create_optimizer(total_loss, learning_rate, num_train_steps, num_warmup_steps)
 
-            output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
+            output_spec = tf.estimator.EstimatorSpec(
                 mode=mode,
                 loss=total_loss,
-                train_op=train_op,
-                scaffold_fn=scaffold_fn)
+                train_op=train_op)
         elif mode == tf.estimator.ModeKeys.PREDICT:
             predictions = {
-                "unique_id": unique_id,
+                "unique_ids": unique_ids,
                 "start_logits": start_logits,
                 "end_logits": end_logits,
                 "answer_type_logits": answer_type_logits,
             }
-            output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
-                mode=mode, predictions=predictions, scaffold_fn=scaffold_fn)
+            output_spec = tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
         else:
-            raise ValueError("Only TRAIN and PREDICT modes are supported: %s" %
-                             (mode))
+            raise ValueError("Only TRAIN and PREDICT modes are supported: %s" % (mode))
 
         return output_spec
 
@@ -432,27 +254,27 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
     """Creates an `input_fn` closure to be passed to TPUEstimator."""
 
     name_to_features = {
-        "unique_id": tf.io.FixedLenFeature([], tf.int64),
-        "input_ids": tf.io.FixedLenFeature([seq_length], tf.int64),
-        "input_mask": tf.io.FixedLenFeature([seq_length], tf.int64),
-        "segment_ids": tf.io.FixedLenFeature([seq_length], tf.int64),
+        "unique_ids": tf.FixedLenFeature([], tf.int64),
+        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
+        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
     }
 
     if is_training:
-        name_to_features["start_positions"] = tf.io.FixedLenFeature([], tf.int64)
-        name_to_features["end_positions"] = tf.io.FixedLenFeature([], tf.int64)
-        name_to_features["answer_types"] = tf.io.FixedLenFeature([], tf.int64)
+        name_to_features["start_positions"] = tf.FixedLenFeature([], tf.int64)
+        name_to_features["end_positions"] = tf.FixedLenFeature([], tf.int64)
+        name_to_features["answer_types"] = tf.FixedLenFeature([], tf.int64)
 
     def _decode_record(record, name_to_features):
         """Decodes a record to a TensorFlow example."""
-        example = tf.io.parse_single_example(serialized=record, features=name_to_features)
+        example = tf.parse_single_example(record, name_to_features)
 
         # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
         # So cast all int64 to int32.
         for name in list(example.keys()):
             t = example[name]
             if t.dtype == tf.int64:
-                t = tf.cast(t, dtype=tf.int32)
+                t = tf.to_int32(t)
             example[name] = t
 
         return example
@@ -479,9 +301,7 @@ def input_fn_builder(input_file, seq_length, is_training, drop_remainder):
     return input_fn
 
 
-RawResult = collections.namedtuple(
-    "RawResult",
-    ["unique_id", "start_logits", "end_logits", "answer_type_logits"])
+RawResult = collections.namedtuple("RawResult", ["unique_id", "start_logits", "end_logits", "answer_type_logits"])
 
 
 class FeatureWriter:
@@ -524,42 +344,6 @@ class FeatureWriter:
         self._writer.close()
 
 
-def read_candidates_from_one_split(input_path):
-    """Read candidates from a single jsonl file."""
-    candidates_dict = {}
-    print("Reading examples from: %s" % input_path)
-    if input_path.endswith(".gz"):
-        with gzip.GzipFile(fileobj=tf.io.gfile.GFile(input_path, "rb")) as input_file:
-            for index, line in enumerate(input_file):
-                e = json.loads(line)
-                candidates_dict[e["example_id"]] = e["long_answer_candidates"]
-
-    else:
-        with tf.io.gfile.GFile(input_path, "r") as input_file:
-            for index, line in enumerate(input_file):
-                e = json.loads(line)
-                candidates_dict[e["example_id"]] = e["long_answer_candidates"]
-    return candidates_dict
-
-
-def read_candidates(input_pattern):
-    """Read candidates with real multiple processes."""
-    input_paths = tf.io.gfile.glob(input_pattern)
-    final_dict = {}
-    for input_path in input_paths:
-        final_dict.update(read_candidates_from_one_split(input_path))
-    return final_dict
-
-
-class EvalExample:
-    """Eval data available for a single example."""
-    def __init__(self, example_id, candidates):
-        self.example_id = example_id
-        self.candidates = candidates
-        self.results = {}
-        self.features = {}
-
-
 class ScoreSummary:
     def __init__(self):
         self.predicted_label = None
@@ -575,7 +359,7 @@ def top_k_indices(logits,n_best_size,token_map):
 
 
 def compute_predictions(example):
-    """Converts an example into an NQEval object for evaluation."""
+    """Converts an example into an object for evaluation."""
     predictions = []
     n_best_size = FLAGS.n_best_size
     max_answer_length = FLAGS.max_answer_length
@@ -585,20 +369,17 @@ def compute_predictions(example):
             raise ValueError("No feature found with unique_id:", unique_id)
         token_map = np.array(example.features[unique_id]["token_map"]) #.int64_list.value
         start_indexes = top_k_indices(result.start_logits,n_best_size,token_map)
-        if len(start_indexes)==0:
+        if not start_indexes:
             continue
-        end_indexes   = top_k_indices(result.end_logits,n_best_size,token_map)
-        if len(end_indexes)==0:
+        end_indexes = top_k_indices(result.end_logits,n_best_size,token_map)
+        if not end_indexes:
             continue
         indexes = np.array(list(np.broadcast(start_indexes[None],end_indexes[:,None])))
         indexes = indexes[(indexes[:,0]<indexes[:,1])*(indexes[:,1]-indexes[:,0]<max_answer_length)]
         for start_index,end_index in indexes:
             summary = ScoreSummary()
-            summary.short_span_score = (
-                    result.start_logits[start_index] +
-                    result.end_logits[end_index])
-            summary.cls_token_score = (
-                    result.start_logits[0] + result.end_logits[0])
+            summary.short_span_score = (result.start_logits[start_index] + result.end_logits[end_index])
+            summary.cls_token_score = (result.start_logits[0] + result.end_logits[0])
             summary.answer_type_logits = result.answer_type_logits-result.answer_type_logits.mean()
             start_span = token_map[start_index]
             end_span = token_map[end_index] + 1
@@ -611,8 +392,8 @@ def compute_predictions(example):
     # Default empty prediction.
     score = -10000.0
     short_span = Span(-1, -1)
-    long_span  = Span(-1, -1)
-    summary    = ScoreSummary()
+    long_span = Span(-1, -1)
+    summary = ScoreSummary()
 
     if predictions:
         score, _, summary, start_span, end_span = sorted(predictions, reverse=True)[0]
@@ -620,7 +401,6 @@ def compute_predictions(example):
         for c in example.candidates:
             start = short_span.start_token_idx
             end = short_span.end_token_idx
-            ## print(c['top_level'],c['start_token'],start,c['end_token'],end)
             if c["top_level"] and c["start_token"] <= start and c["end_token"] >= end:
                 long_span = Span(c["start_token"], c["end_token"])
                 break
@@ -649,13 +429,13 @@ def compute_predictions(example):
     return summary
 
 
-def compute_pred_dict(candidates_dict, dev_features, raw_results,tqdm=None):
+def predictions_to_dict(candidates_dict, dev_features, raw_results, tqdm=None):
     """Computes official answer key from raw logits."""
-    raw_results_by_id = [(int(res.unique_id),1, res) for res in raw_results]
+    raw_results_by_id = [(int(res.unique_id), 1, res) for res in raw_results]
 
-    examples_by_id = [(int(k),0,v) for k, v in candidates_dict.items()]
+    examples_by_id = [(int(k), 0, v) for k, v in candidates_dict.items()]
 
-    features_by_id = [(int(d['unique_id']),2,d) for d in dev_features]
+    features_by_id = [(int(d['unique_id']), 2, d) for d in dev_features]
 
     # Join examples with features and raw results.
     examples = []
@@ -663,9 +443,9 @@ def compute_pred_dict(candidates_dict, dev_features, raw_results,tqdm=None):
     merged = sorted(examples_by_id + raw_results_by_id + features_by_id)
     print('done.')
     for idx, type_, datum in merged:
-        if type_==0: #isinstance(datum, list):
+        if type_ == 0:  #isinstance(datum, list):
             examples.append(EvalExample(idx, datum))
-        elif type_==2: #"token_map" in datum:
+        elif type_ == 2:  #"token_map" in datum:
             examples[-1].features[idx] = datum
         else:
             examples[-1].results[idx] = datum

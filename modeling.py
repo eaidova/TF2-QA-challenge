@@ -1,8 +1,10 @@
 """The main BERT model and related functions."""
+import re
 import copy
 import json
 import math
 import six
+from collections import OrderedDict
 import tensorflow as tf
 
 
@@ -280,7 +282,7 @@ class BertModel(tf.keras.layers.Layer):
 
     def __init__(self, config, float_type=tf.float32, **kwargs):
         super(BertModel, self).__init__(**kwargs)
-        self.config = (BertConfig.from_dict(config) if isinstance(config, dict) else copy.deepcopy(config))
+        self.config = BertConfig.from_dict(config) if isinstance(config, dict) else copy.deepcopy(config)
         self.float_type = float_type
 
     def build(self, unused_input_shapes):
@@ -291,6 +293,7 @@ class BertModel(tf.keras.layers.Layer):
             initializer_range=self.config.initializer_range,
             dtype=tf.float32,
             name="word_embeddings")
+
         self.embedding_postprocessor = EmbeddingPostprocessor(
             use_type_embeddings=True,
             token_type_vocab_size=self.config.type_vocab_size,
@@ -300,6 +303,7 @@ class BertModel(tf.keras.layers.Layer):
             initializer_range=self.config.initializer_range,
             dtype=tf.float32,
             name="embedding_postprocessor")
+
         self.encoder = Transformer(
             num_hidden_layers=self.config.num_hidden_layers,
             hidden_size=self.config.hidden_size,
@@ -312,11 +316,13 @@ class BertModel(tf.keras.layers.Layer):
             backward_compatible=self.config.backward_compatible,
             float_type=self.float_type,
             name="encoder")
+
         self.pooler_transform = tf.keras.layers.Dense(
             units=self.config.hidden_size,
             activation="tanh",
             kernel_initializer=get_initializer(self.config.initializer_range),
             name="pooler_transform")
+
         super(BertModel, self).build(unused_input_shapes)
 
     def __call__(self,
@@ -325,6 +331,7 @@ class BertModel(tf.keras.layers.Layer):
                  input_type_ids=None,
                  **kwargs):
         inputs = pack_inputs([input_word_ids, input_mask, input_type_ids])
+
         return super(BertModel, self).__call__(inputs, **kwargs)
 
     def call(self, inputs, mode="bert"):
@@ -345,9 +352,11 @@ class BertModel(tf.keras.layers.Layer):
 
         word_embeddings = self.embedding_lookup(input_word_ids)
         embedding_tensor = self.embedding_postprocessor(word_embeddings=word_embeddings, token_type_ids=input_type_ids)
+
         if self.float_type == tf.float16:
             embedding_tensor = tf.cast(embedding_tensor, tf.float16)
         attention_mask = None
+
         if input_mask is not None:
             attention_mask = create_attention_mask_from_input_mask(input_word_ids, input_mask)
 
@@ -358,11 +367,12 @@ class BertModel(tf.keras.layers.Layer):
         first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
         pooled_output = self.pooler_transform(first_token_tensor)
 
-        return (pooled_output, sequence_output)
+        return pooled_output, sequence_output
 
     def get_config(self):
         config = {"config": self.config.to_dict()}
         base_config = super(BertModel, self).get_config()
+
         return dict(list(base_config.items()) + list(config.items()))
 
 
@@ -394,6 +404,7 @@ class EmbeddingLookup(tf.keras.layers.Layer):
         flat_input = tf.reshape(inputs, [-1])
         output = tf.gather(self.embeddings, flat_input)
         output = tf.reshape(output, input_shape + [self.embedding_size])
+
         return output
 
 
@@ -696,6 +707,7 @@ class Dense3D(tf.keras.layers.Layer):
             initializer=self.kernel_initializer,
             dtype=self.dtype,
             trainable=True)
+
         if self.use_bias:
             self.bias = self.add_weight(
                 "bias",
@@ -705,6 +717,7 @@ class Dense3D(tf.keras.layers.Layer):
                 trainable=True)
         else:
             self.bias = None
+
         super(Dense3D, self).build(input_shape)
 
     def call(self, inputs):
@@ -1022,3 +1035,29 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
     mask = broadcast_ones * to_mask
 
     return mask
+
+
+def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
+    """Compute the union of the current variables and checkpoint variables."""
+    initialized_variable_names = {}
+
+    name_to_variable = OrderedDict()
+    for var in tvars:
+        name = var.name
+        m = re.match("^(.*):\\d+$", name)
+        if m is not None:
+            name = m.group(1)
+        name_to_variable[name] = var
+
+    init_vars = tf.train.list_variables(init_checkpoint)
+
+    assignment_map = OrderedDict()
+    for x in init_vars:
+        (name, var) = (x[0], x[1])
+        if name not in name_to_variable:
+            continue
+        assignment_map[name] = name
+        initialized_variable_names[name] = 1
+        initialized_variable_names[name + ":0"] = 1
+
+    return assignment_map, initialized_variable_names

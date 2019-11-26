@@ -1,9 +1,15 @@
 import collections
+import gzip
+
 import enum
 import json
 import re
+
+import tensorflow as tf
 from tqdm import tqdm
 
+from bert_utils import make_answer
+from tokenization import whitespace_tokenize
 
 TextSpan = collections.namedtuple("TextSpan", "token_positions text")
 
@@ -66,6 +72,7 @@ def get_first_annotation(example):
             idx = annotation["long_answer"]["candidate_index"]
             start_token = annotation["short_answers"][0]["start_token"]
             end_token = annotation["short_answers"][-1]["end_token"]
+
             return annotation, idx, (token_to_char_offset(example, idx, start_token), token_to_char_offset(e, idx, end_token) - 1)
 
     for a in positive_annotations:
@@ -264,7 +271,7 @@ def convert_examples_to_features(examples, tokenizer, is_training, output_fn):
 
 
 def convert_single_example(example, tokenizer, max_query_len=100, max_seq_len=50, doc_stride=2, is_training=True):
-    """Converts a single NqExample into a list of InputFeatures."""
+    """Converts a single Example into a list of InputFeatures."""
     tok_to_orig_index = []
     orig_to_tok_index = []
     all_doc_tokens = []
@@ -396,7 +403,6 @@ def convert_single_example(example, tokenizer, max_query_len=100, max_seq_len=50
 
     return features
 
-# A special token in NQ is made of non-space chars enclosed in square brackets.
 _SPECIAL_TOKENS_RE = re.compile(r"^\[[^ ]*\]$", re.UNICODE)
 def tokenize(tokenizer, text, apply_basic_tokenization=False):
     """Tokenizes text, optionally looking up special tokens separately.
@@ -416,11 +422,189 @@ def tokenize(tokenizer, text, apply_basic_tokenization=False):
         tokenize_fn = tokenizer.basic_tokenizer.tokenize
     tokens = []
     for token in text.split(" "):
-       if _SPECIAL_TOKENS_RE.match(token):
-           if token in tokenizer.vocab:
-               tokens.append(token)
-           else:
-               tokens.append(tokenizer.wordpiece_tokenizer.unk_token)
-       else:
-           tokens.extend(tokenize_fn(token))
+        if _SPECIAL_TOKENS_RE.match(token):
+            if token in tokenizer.vocab:
+                tokens.append(token)
+            else:
+                tokens.append(tokenizer.wordpiece_tokenizer.unk_token)
+        else:
+            tokens.extend(tokenize_fn(token))
     return tokens
+
+
+class Example:
+    """A single training/test example."""
+
+    def __init__(self,
+                 example_id,
+                 qas_id,
+                 questions,
+                 doc_tokens,
+                 doc_tokens_map=None,
+                 answer=None,
+                 start_position=None,
+                 end_position=None):
+        self.example_id = example_id
+        self.qas_id = qas_id
+        self.questions = questions
+        self.doc_tokens = doc_tokens
+        self.doc_tokens_map = doc_tokens_map
+        self.answer = answer
+        self.start_position = start_position
+        self.end_position = end_position
+
+
+def read_entry(entry, is_training):
+    def is_whitespace(c):
+        return c in " \t\r\n" or ord(c) == 0x202F
+
+    examples = []
+    contexts_id = entry["id"]
+    contexts = entry["contexts"]
+    doc_tokens = []
+    char_to_word_offset = []
+    prev_is_whitespace = True
+    for c in contexts:
+        if is_whitespace(c):
+            prev_is_whitespace = True
+        else:
+            if prev_is_whitespace:
+                doc_tokens.append(c)
+            else:
+                doc_tokens[-1] += c
+            prev_is_whitespace = False
+        char_to_word_offset.append(len(doc_tokens) - 1)
+
+    questions = []
+    for i, question in enumerate(entry["questions"]):
+        qas_id = "{}".format(contexts_id)
+        question_text = question["input_text"]
+        start_position = None
+        end_position = None
+        answer = None
+        if is_training:
+            answer_dict = entry["answers"][i]
+            answer = make_answer(contexts, answer_dict)
+
+            # For now, only handle extractive, yes, and no.
+            if answer is None or answer.offset is None:
+                continue
+            start_position = char_to_word_offset[answer.offset]
+            end_position = char_to_word_offset[answer.offset + len(answer.text) - 1]
+
+            # Only add answers where the text can be exactly recovered from the
+            # document. If this CAN'T happen it's likely due to weird Unicode
+            # stuff so we will just skip the example.
+            #
+            # Note that this means for training mode, every example is NOT
+            # guaranteed to be preserved.
+            actual_text = " ".join(doc_tokens[start_position:(end_position + 1)])
+            cleaned_answer_text = " ".join(
+                whitespace_tokenize(answer.text))
+            if actual_text.find(cleaned_answer_text) == -1:
+                tf.compat.v1.logging.warning("Could not find answer: '%s' vs. '%s'", actual_text, cleaned_answer_text)
+                continue
+
+        questions.append(question_text)
+        example = Example(
+            example_id=int(contexts_id),
+            qas_id=qas_id,
+            questions=questions[:],
+            doc_tokens=doc_tokens,
+            doc_tokens_map=entry.get("contexts_map", None),
+            answer=answer,
+            start_position=start_position,
+            end_position=end_position)
+        examples.append(example)
+    return examples
+
+
+class ConvertExamples2Features:
+    def __init__(self,tokenizer, is_training, output_fn, collect_stat=False):
+        self.tokenizer = tokenizer
+        self.is_training = is_training
+        self.output_fn = output_fn
+        self.num_spans_to_ids = collections.defaultdict(list) if collect_stat else None
+
+    def __call__(self,example):
+        example_index = example.example_id
+        features = convert_single_example(example, self.tokenizer, self.is_training)
+        if self.num_spans_to_ids is not None:
+            self.num_spans_to_ids[len(features)].append(example.qas_id)
+
+        for feature in features:
+            feature.example_index = example_index
+            feature.unique_id = feature.example_index + feature.doc_span_index
+            self.output_fn(feature)
+        return len(features)
+
+
+def examples_iter(input_file, is_training, max_contexts, max_position, tqdm=None):
+    """Read a json file into a list of Example."""
+    input_paths = tf.io.gfile.glob(input_file)
+
+    def _open(path):
+        return tf.io.gfile.GFile(path, "r")
+
+    for path in input_paths:
+        tf.compat.v1.logging.info("Reading: %s"% path)
+        with _open(path) as input_file:
+            if tqdm is not None:
+                input_file = tqdm(input_file)
+            for index, line in enumerate(input_file):
+                entry = create_example_from_jsonl(line, max_contexts, max_position)
+                yield read_entry(entry, is_training)
+
+
+def read_examples(input_file, is_training, max_contexts, max_position, tqdm=None):
+    """Read a json file into a list of Example."""
+    input_paths = tf.io.gfile.glob(input_file)
+    input_data = []
+
+    def _open(path):
+        if path.endswith(".gz"):
+            return gzip.GzipFile(fileobj=tf.io.gfile.GFile(path, "rb"))
+        else:
+            return tf.io.gfile.GFile(path, "r")
+
+    for path in input_paths:
+        tf.compat.v1.logging.info("Reading: %s", path)
+        with _open(path) as input_file:
+            if tqdm is not None:
+                input_file = tqdm(input_file)
+            for index, line in enumerate(input_file):
+                input_data.append(create_example_from_jsonl(line, max_contexts, max_position))
+
+    examples = []
+    for entry in input_data:
+        examples.extend(read_entry(entry, is_training))
+    return examples
+
+
+def read_candidates_from_one_split(input_path):
+    """Read candidates from a single jsonl file."""
+    candidates_dict = {}
+    print("Reading examples from: %s" % input_path)
+    with tf.io.gfile.GFile(input_path, "r") as input_file:
+        for index, line in enumerate(input_file):
+            e = json.loads(line)
+            candidates_dict[e["example_id"]] = e["long_answer_candidates"]
+    return candidates_dict
+
+
+def read_candidates(input_pattern):
+    """Read candidates with real multiple processes."""
+    input_paths = tf.io.gfile.glob(input_pattern)
+    final_dict = {}
+    for input_path in input_paths:
+        final_dict.update(read_candidates_from_one_split(input_path))
+    return final_dict
+
+
+class EvalExample:
+    """Eval data available for a single example."""
+    def __init__(self, example_id, candidates):
+        self.example_id = example_id
+        self.candidates = candidates
+        self.results = {}
+        self.features = {}
