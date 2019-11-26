@@ -1,5 +1,5 @@
 import collections
-import gzip
+import random
 
 import enum
 import json
@@ -9,7 +9,7 @@ import tensorflow as tf
 from tqdm import tqdm
 
 from bert_utils import make_answer
-from tokenization import whitespace_tokenize
+from tokenization import whitespace_tokenize, FullTokenizer
 
 TextSpan = collections.namedtuple("TextSpan", "token_positions text")
 
@@ -184,8 +184,8 @@ def create_example_from_jsonl(example, max_contexts, max_position):
 
     # Yes/no answers are added in the input text.
     if annotation is not None:
-       if annotation["yes_no_answer"] in ("YES", "NO"):
-           answer["input_text"] = annotation["yes_no_answer"].lower()
+        if annotation["yes_no_answer"] in ("YES", "NO"):
+            answer["input_text"] = annotation["yes_no_answer"].lower()
 
     # Add a short answer if one was found.
     if annotated_sa != (-1, -1):
@@ -194,7 +194,11 @@ def create_example_from_jsonl(example, max_contexts, max_position):
         answer["span_text"] = span_text[annotated_sa[0]:annotated_sa[1]]
         answer["span_start"] = annotated_sa[0]
         answer["span_end"] = annotated_sa[1]
-        expected_answer_text = get_text_span(example, {"start_token": annotation["short_answers"][0]["start_token"], "end_token": annotation["short_answers"][-1]["end_token"],}).text
+        expected_answer_text = get_text_span(
+            example,
+            {"start_token": annotation["short_answers"][0]["start_token"],
+             "end_token": annotation["short_answers"][-1]["end_token"]}
+        ).text
         assert expected_answer_text == answer["span_text"], (expected_answer_text, answer["span_text"])
 
     # Add a long answer if one was found.
@@ -562,10 +566,7 @@ def read_examples(input_file, is_training, max_contexts, max_position, tqdm=None
     input_data = []
 
     def _open(path):
-        if path.endswith(".gz"):
-            return gzip.GzipFile(fileobj=tf.io.gfile.GFile(path, "rb"))
-        else:
-            return tf.io.gfile.GFile(path, "r")
+        return tf.io.gfile.GFile(path, "r")
 
     for path in input_paths:
         tf.compat.v1.logging.info("Reading: %s", path)
@@ -608,3 +609,74 @@ class EvalExample:
         self.candidates = candidates
         self.results = {}
         self.features = {}
+
+
+def prepare_training_data(vocab_file, train_file, lower_case, output_file, max_contexts, max_position):
+    examples_processed = 0
+    num_examples_with_correct_context = 0
+    creator_fn = CreateTFExampleFn(is_training=True, vocab_file=vocab_file, do_lower_case=lower_case)
+
+    instances = []
+    for example in examples_iter(train_file, max_contexts, max_position):
+        for instance in creator_fn.process(example):
+            instances.append(instance)
+        if example["has_correct_context"]:
+            num_examples_with_correct_context += 1
+        if examples_processed % 100 == 0:
+            tf.logging.info("Examples processed: %d", examples_processed)
+        examples_processed += 1
+    tf.logging.info("Examples with correct context retained: %d of %d",
+                    num_examples_with_correct_context, examples_processed)
+
+    random.shuffle(instances)
+    with tf.python_io.TFRecordWriter(output_file) as writer:
+        for instance in instances:
+            writer.write(instance)
+    tf.logging.info("Number precomputed: %d", len(instances))
+
+    return len(instances)
+
+
+class CreateTFExampleFn:
+    """Functor for creating tf.Examples."""
+
+    def __init__(self, is_training, vocab_file, do_lower_case):
+        self.is_training = is_training
+        self.tokenizer = FullTokenizer(vocab_file=vocab_file, do_lower_case=do_lower_case)
+
+    def process(self, example):
+        """Coverts an example in a list of serialized tf examples."""
+        entries = read_entry(example, self.is_training)
+        input_features = []
+        for entry in entries:
+            input_features.extend(convert_single_example(entry, self.tokenizer, self.is_training))
+
+        for input_feature in input_features:
+            input_feature.example_index = int(example["id"])
+            input_feature.unique_id = (
+                    input_feature.example_index + input_feature.doc_span_index)
+
+            def create_int_feature(values):
+                return tf.train.Feature(
+                    int64_list=tf.train.Int64List(value=list(values)))
+
+            features = collections.OrderedDict()
+            features["unique_id"] = create_int_feature([input_feature.unique_id])
+            features["input_ids"] = create_int_feature(input_feature.input_ids)
+            features["input_mask"] = create_int_feature(input_feature.input_mask)
+            features["segment_ids"] = create_int_feature(input_feature.segment_ids)
+
+            if self.is_training:
+                features["start_positions"] = create_int_feature(
+                    [input_feature.start_position])
+                features["end_positions"] = create_int_feature(
+                    [input_feature.end_position])
+                features["answer_types"] = create_int_feature(
+                    [input_feature.answer_type])
+            else:
+                token_map = [-1] * len(input_feature.input_ids)
+                for k, v in input_feature.token_to_orig_map.items():
+                    token_map[k] = v
+                features["token_map"] = create_int_feature(token_map)
+
+            yield tf.train.Example(features=tf.train.Features(feature=features)).SerializeToString()

@@ -9,14 +9,9 @@ from bert_utils import (
     predictions_to_dict,
     RawResult
 )
-from dataset import convert_examples_to_features, read_examples, read_candidates
+from dataset import convert_examples_to_features, read_examples, read_candidates, prepare_training_data
 from modeling import BertConfig
 from tokenization import FullTokenizer
-
-
-flags.DEFINE_boolean(
-    "skip_nested_contexts", True,
-    "Completely ignore context that are not top level nodes in the page.")
 
 
 def build_arguments_parser():
@@ -27,6 +22,7 @@ def build_arguments_parser():
     )
     parser.add_argument('--vocab_file', help="The vocabulary file that the BERT model was trained on.")
     parser.add_argument('--output_dir', help="The output directory where the model checkpoints will be written.")
+    parser.add_argument('--train_file', help='train jsonl file for conversion to tf records', required=False)
     parser.add_argument('--train_precomputed_file', help="Precomputed tf records for training.", required=False)
     parser.add_argument('--predict_file', help='json input file for predictions', required=False)
     parser.add_argument('--output_prediction_file', help='json file for prediction result')
@@ -78,14 +74,24 @@ def main():
     args = parser.parse_args()
     tf.logging.set_verbosity(tf.logging.INFO)
     bert_config = BertConfig.from_json_file(args.bert_config_file)
-    tf.gfile.MakeDirs(FLAGS.output_dir)
-
+    tf.gfile.MakeDirs(args.output_dir)
     tokenizer = FullTokenizer(vocab_file=args.vocab_file, do_lower_case=args.do_lower_case)
 
     num_train_steps = None
     num_warmup_steps = None
+    train_precomputed_file = args.train_precomputed_file
     if args.do_train:
-        num_train_features = args.train_num_precomputed
+        train_num_precomputed = args.train_num_precomputed
+        if args.train_precomputed_file is None:
+            if args.train_file is None:
+                raise ValueError('train_file or _precomputed_train_file should be provided')
+            train_num_precomputed = prepare_training_data(
+                args.vocab_file, args.train_file, args.do_lower_case,
+                'data/train.tfrecords',
+                args.max_context, args.max_position
+            )
+            train_precomputed_file = 'data/train.tfrecords'
+        num_train_features = train_num_precomputed
         num_train_steps = int(num_train_features / args.train_batch_size * args.num_train_epochs)
 
         num_warmup_steps = int(num_train_steps * args.warmup_proportion)
@@ -105,7 +111,7 @@ def main():
         tf.logging.info("  Num split examples = %d", num_train_features)
         tf.logging.info("  Batch size = %d", args.train_batch_size)
         tf.logging.info("  Num steps = %d", num_train_steps)
-        train_filenames = tf.gfile.Glob(args.train_precomputed_file)
+        train_filenames = tf.gfile.Glob(train_precomputed_file)
         train_input_fn = input_fn_builder(
             input_file=train_filenames,
             seq_length=args.max_seq_length,

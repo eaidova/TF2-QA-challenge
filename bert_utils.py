@@ -2,9 +2,8 @@ import collections
 
 import numpy as np
 import tensorflow as tf
-from dataset import AnswerType, Answer, convert_single_example, read_entry, EvalExample
+from dataset import AnswerType, Answer, EvalExample
 from modeling import BertModel, get_shape_list, get_assignment_map_from_checkpoint
-from tokenization import FullTokenizer
 from optimization import create_optimizer
 
 
@@ -42,52 +41,6 @@ def make_answer(contexts, answer):
         answer_type = answer_types.get(input_text.lower(), AnswerType.SHORT)
 
     return Answer(answer_type, text=contexts[start:end], offset=start)
-
-
-class CreateTFExampleFn:
-    """Functor for creating NQ tf.Examples."""
-
-    def __init__(self, is_training, vocab_file, do_lower_case):
-        self.is_training = is_training
-        self.tokenizer = FullTokenizer(vocab_file=vocab_file, do_lower_case=do_lower_case)
-
-    def process(self, example):
-        """Coverts an NQ example in a list of serialized tf examples."""
-        nq_examples = read_entry(example, self.is_training)
-        input_features = []
-        for nq_example in nq_examples:
-            input_features.extend(convert_single_example(nq_example, self.tokenizer, self.is_training))
-
-        for input_feature in input_features:
-            input_feature.example_index = int(example["id"])
-            input_feature.unique_id = (
-                    input_feature.example_index + input_feature.doc_span_index)
-
-            def create_int_feature(values):
-                return tf.train.Feature(
-                    int64_list=tf.train.Int64List(value=list(values)))
-
-            features = collections.OrderedDict()
-            features["unique_id"] = create_int_feature([input_feature.unique_id])
-            features["input_ids"] = create_int_feature(input_feature.input_ids)
-            features["input_mask"] = create_int_feature(input_feature.input_mask)
-            features["segment_ids"] = create_int_feature(input_feature.segment_ids)
-
-            if self.is_training:
-                features["start_positions"] = create_int_feature(
-                    [input_feature.start_position])
-                features["end_positions"] = create_int_feature(
-                    [input_feature.end_position])
-                features["answer_types"] = create_int_feature(
-                    [input_feature.answer_type])
-            else:
-                token_map = [-1] * len(input_feature.input_ids)
-                for k, v in input_feature.token_to_orig_map.items():
-                    token_map[k] = v
-                features["token_map"] = create_int_feature(token_map)
-
-            yield tf.train.Example(features=tf.train.Features(
-                feature=features)).SerializeToString()
 
 
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, use_one_hot_embeddings):
