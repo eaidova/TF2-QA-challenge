@@ -4,7 +4,7 @@ Repository for submission code for TF2.0 QA Challenge on [kaggle](https://www.ka
 Baseline model, last trained checkpoints and dataset converted to TF records available on [Google Drive](https://drive.google.com/open?id=1SNzHWpZuc_twnmjfBfyGardRO628AS2w)
 
 ## Prerequisites
-Python setuptools and python package manager (pip) install packages into system directory by default. Installation of accuracy checker tested only via [virtual environment](https://docs.python.org/3/tutorial/venv.html).
+Python setuptools and python package manager (pip) install packages into system directory by default.  The training code tested only via [virtual environment](https://docs.python.org/3/tutorial/venv.html).
 
 In order to use virtual environment you should install it first:
 
@@ -36,16 +36,18 @@ BERT Baseline for NQ selected as baseline model. [[Original Repository](https://
 Training code can work with both original annotation format and preprocessed. Data preparation is time consuming process, I recommend to save it in TF records format for future experiments.
 
 ## Training
+1. download baseline model to **bert-joint-baseline** directory from [Google Drive](https://drive.google.com/open?id=1SNzHWpZuc_twnmjfBfyGardRO628AS2w)
+2. Download preprocessed data to **data** directory [Google Drive](https://drive.google.com/open?id=1SNzHWpZuc_twnmjfBfyGardRO628AS2w)
+
 Following command run default baseline model training. For information about additional arguments please use `--help` option.
-​```bash
+```bash
 python main.py --bert_config_file bert-joint-baseline/bert_config.json \
 --vocab_file bert-joint-baseline/vocab-nq.txt \
---train_precomputed_file nq-train.tfrecords \
+--train_precomputed_file data/nq-train.tfrecords \
 --init_checkpoint bert-joint-baseline/bert_joint.ckpt
 --do_train \
 --output_dir bert_model_output \
 --do_lower_case \
 --train_num_precomputed 494670
-```
 
 ```
