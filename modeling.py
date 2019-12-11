@@ -281,7 +281,7 @@ class BertModel(tf.keras.layers.Layer):
     """
 
     def __init__(self, config, float_type=tf.float32, **kwargs):
-        super(BertModel, self).__init__()
+        super().__init__()
         self.config = BertConfig.from_dict(config) if isinstance(config, dict) else copy.deepcopy(config)
         self.float_type = float_type
 
@@ -323,7 +323,7 @@ class BertModel(tf.keras.layers.Layer):
             kernel_initializer=get_initializer(self.config.initializer_range),
             name="pooler_transform")
 
-        super(BertModel, self).build(unused_input_shapes)
+        super().build(unused_input_shapes)
 
     def __call__(self,
                  input_word_ids,
@@ -332,7 +332,7 @@ class BertModel(tf.keras.layers.Layer):
                  **kwargs):
         inputs = pack_inputs([input_word_ids, input_mask, input_type_ids])
 
-        return super(BertModel, self).__call__(inputs, **kwargs)
+        return super().__call__(inputs, **kwargs)
 
     def call(self, inputs, mode="bert"):
         """Implements call() for the layer.
@@ -371,7 +371,7 @@ class BertModel(tf.keras.layers.Layer):
 
     def get_config(self):
         config = {"config": self.config.to_dict()}
-        base_config = super(BertModel, self).get_config()
+        base_config = super().get_config()
 
         return dict(list(base_config.items()) + list(config.items()))
 
@@ -384,7 +384,7 @@ class EmbeddingLookup(tf.keras.layers.Layer):
                  embedding_size=768,
                  initializer_range=0.02,
                  **kwargs):
-        super(EmbeddingLookup, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.embedding_size = embedding_size
         self.initializer_range = initializer_range
@@ -396,7 +396,7 @@ class EmbeddingLookup(tf.keras.layers.Layer):
             shape=[self.vocab_size, self.embedding_size],
             initializer=get_initializer(self.initializer_range),
             dtype=self.dtype)
-        super(EmbeddingLookup, self).build(unused_input_shapes)
+        super().build(unused_input_shapes)
 
     def call(self, inputs):
         """Implements call() for the layer."""
@@ -420,7 +420,7 @@ class EmbeddingPostprocessor(tf.keras.layers.Layer):
                  initializer_range=0.02,
                  initializer=None,
                  **kwargs):
-        super(EmbeddingPostprocessor, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self.use_type_embeddings = use_type_embeddings
         self.token_type_vocab_size = token_type_vocab_size
         self.use_position_embeddings = use_position_embeddings
